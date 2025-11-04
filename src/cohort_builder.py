@@ -41,12 +41,18 @@ EXPECTED_DB_SCHEMA = {
     'claims_entries': ['claim_entry_id', 'member_id_hash', 'date_of_service', 'claim_type'],
     'claims_diagnoses': ['claim_entry_id', 'icd_code'],
     'members': ['member_id_hash'],
+}
+
+# Optional tables (won't fail if missing)
+OPTIONAL_DB_SCHEMA = {
     'claims_members_monthly_utilization': ['member_id_hash'],
 }
 
 def check_db_schema(engine):
     import sqlalchemy
     insp = sqlalchemy.inspect(engine)
+    
+    # Check required tables
     for table, columns in EXPECTED_DB_SCHEMA.items():
         if not insp.has_table(table):
             logging.error(f"Missing required table: {table}")
@@ -56,6 +62,16 @@ def check_db_schema(engine):
             if col not in actual_cols:
                 logging.error(f"Missing required column '{col}' in table '{table}'")
                 raise RuntimeError(f"Missing required column '{col}' in table '{table}'")
+    
+    # Check optional tables (only warn if missing)
+    for table, columns in OPTIONAL_DB_SCHEMA.items():
+        if not insp.has_table(table):
+            logging.warning(f"Optional table '{table}' not found in database. Skipping schema check...")
+            continue
+        actual_cols = [col['name'] for col in insp.get_columns(table)]
+        for col in columns:
+            if col not in actual_cols:
+                logging.warning(f"Missing optional column '{col}' in table '{table}'")
 
 class CohortBuilder:
     """

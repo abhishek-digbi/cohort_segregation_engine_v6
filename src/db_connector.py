@@ -21,11 +21,34 @@ class DBConnector:
 
     def load_tables(self):
         """Load required tables from database using SQLAlchemy engine"""
-        self.tables = {
-            'claims_entries': pd.read_sql('SELECT * FROM claims_entries', self.engine),
-            'claims_diagnoses': pd.read_sql('SELECT * FROM claims_diagnoses', self.engine),
-            'claims_procedures': pd.read_sql('SELECT * FROM claims_procedures', self.engine),
-            'claims_drugs': pd.read_sql('SELECT * FROM claims_drugs', self.engine),
-            'members': pd.read_sql('SELECT * FROM members', self.engine),
-            'claims_members_monthly_utilization': pd.read_sql('SELECT * FROM claims_members_monthly_utilization', self.engine),
+        import sqlalchemy
+        
+        # Required tables
+        required_tables = {
+            'claims_entries': 'SELECT * FROM claims_entries',
+            'claims_diagnoses': 'SELECT * FROM claims_diagnoses',
+            'claims_procedures': 'SELECT * FROM claims_procedures',
+            'claims_drugs': 'SELECT * FROM claims_drugs',
+            'members': 'SELECT * FROM members',
         }
+        
+        # Optional tables (will skip if not present)
+        optional_tables = {
+            'claims_members_monthly_utilization': 'SELECT * FROM claims_members_monthly_utilization',
+        }
+        
+        self.tables = {}
+        
+        # Load required tables
+        insp = sqlalchemy.inspect(self.engine)
+        for table_name, query in required_tables.items():
+            if not insp.has_table(table_name):
+                raise RuntimeError(f"Missing required table: {table_name}")
+            self.tables[table_name] = pd.read_sql(query, self.engine)
+        
+        # Load optional tables (skip if missing)
+        for table_name, query in optional_tables.items():
+            if insp.has_table(table_name):
+                self.tables[table_name] = pd.read_sql(query, self.engine)
+            else:
+                print(f"Warning: Optional table '{table_name}' not found in database. Skipping...")
