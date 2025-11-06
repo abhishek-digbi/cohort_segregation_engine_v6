@@ -4,8 +4,8 @@
 
 ### 1. Clone Repository
 ```bash
-git clone <repository-url>
-cd cohort_segregation_v4
+git clone https://github.com/abhishek-digbi/cohort_segregation_engine_v6.git
+cd cohort_segregation_engine_v6
 ```
 
 ### 2. Install Dependencies
@@ -50,7 +50,7 @@ HTN_Conservative, HTN_Sensitive, Diabetes_General, PreDiabetes, GDM, CAD_Conserv
 
 ## Project Structure
 ```
-cohort_segregation_v4/
+cohort_segregation_engine_v6/
 ├── src/
 ├── configs/
 │   ├── db_connection.yaml
