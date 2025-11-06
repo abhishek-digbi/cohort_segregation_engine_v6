@@ -15,28 +15,14 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 3. Configure Database
+### 3. Test with One Cohort
 ```bash
-cp configs/db_connection.yaml.example configs/db_connection.yaml
+python scripts/run_cohorts.py --cohorts HTN_Conservative --output_dir outputs/test
 ```
 
-Then edit `configs/db_connection.yaml` with your database credentials.
-
-### 4. Test Connection
-```bash
-python test_postgres_connection.py
-```
-
-### 5. Run Cohorts
-
-**All cohorts:**
+### 4. Run All Cohorts
 ```bash
 python scripts/run_cohorts.py --output_dir outputs/my_analysis
-```
-
-**Specific cohorts:**
-```bash
-python scripts/run_cohorts.py --cohorts HTN_Conservative Diabetes_General --output_dir outputs/my_analysis
 ```
 
 **Output files:**
@@ -65,4 +51,3 @@ cohort_segregation_engine_v6/
 - Ensure VPN is connected before running
 - Database credentials must have read access
 - Output files are saved in the specified output directory
-
