@@ -1,0 +1,19 @@
+# Database connection parameters
+# DuckDB (commented out - keeping for reference)
+# duckdb:
+#   database: "claims"
+#   path: "/path/to/your/claims.db"
+
+# PostgreSQL RDS configuration
+postgres:
+  host: "digbi-db-01.colt4va8shxf.us-east-1.rds.amazonaws.com"
+  port: 5432
+  database: "foodrx"
+  user: "readonly_user"
+  password: "v98£8o'F9z[="
+  schema: "public"  # Default; test script will verify actual schema
+
+s3:
+  access_key: "YOUR_AWS_ACCESS_KEY"
+  secret_key: "YOUR_AWS_SECRET_KEY"
+  region: "us-west-1"
