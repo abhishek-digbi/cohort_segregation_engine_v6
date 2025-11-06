@@ -1,0 +1,17 @@
+# Database connection parameters
+# Copy this file to db_connection.yaml and fill in your credentials
+
+# PostgreSQL RDS configuration
+postgres:
+  host: "your-database-host.rds.amazonaws.com"
+  port: 5432
+  database: "foodrx"
+  user: "readonly_user"
+  password: "your_password"
+  schema: "public"
+
+s3:
+  access_key: "YOUR_AWS_ACCESS_KEY"
+  secret_key: "YOUR_AWS_SECRET_KEY"
+  region: "us-west-1"
+

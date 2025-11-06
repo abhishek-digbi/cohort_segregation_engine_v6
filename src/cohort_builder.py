@@ -1,9 +1,10 @@
 import yaml
 import pandas as pd
-import ibis
 import logging
 import pandera as pa
 from pandera import Column, DataFrameSchema, Check
+import sqlalchemy
+from sqlalchemy import text
 
 # Import utils and db_connector with fallback for relative imports
 try:
@@ -48,30 +49,30 @@ OPTIONAL_DB_SCHEMA = {
     'claims_members_monthly_utilization': ['member_id_hash'],
 }
 
-def check_db_schema(engine):
+def check_db_schema(engine, schema='public'):
     import sqlalchemy
     insp = sqlalchemy.inspect(engine)
     
     # Check required tables
     for table, columns in EXPECTED_DB_SCHEMA.items():
-        if not insp.has_table(table):
-            logging.error(f"Missing required table: {table}")
-            raise RuntimeError(f"Missing required table: {table}")
-        actual_cols = [col['name'] for col in insp.get_columns(table)]
+        if not insp.has_table(table, schema=schema):
+            logging.error(f"Missing required table: {schema}.{table}")
+            raise RuntimeError(f"Missing required table: {schema}.{table}")
+        actual_cols = [col['name'] for col in insp.get_columns(table, schema=schema)]
         for col in columns:
             if col not in actual_cols:
-                logging.error(f"Missing required column '{col}' in table '{table}'")
-                raise RuntimeError(f"Missing required column '{col}' in table '{table}'")
+                logging.error(f"Missing required column '{col}' in table '{schema}.{table}'")
+                raise RuntimeError(f"Missing required column '{col}' in table '{schema}.{table}'")
     
     # Check optional tables (only warn if missing)
     for table, columns in OPTIONAL_DB_SCHEMA.items():
-        if not insp.has_table(table):
-            logging.warning(f"Optional table '{table}' not found in database. Skipping schema check...")
+        if not insp.has_table(table, schema=schema):
+            logging.warning(f"Optional table '{schema}.{table}' not found in database. Skipping schema check...")
             continue
-        actual_cols = [col['name'] for col in insp.get_columns(table)]
+        actual_cols = [col['name'] for col in insp.get_columns(table, schema=schema)]
         for col in columns:
             if col not in actual_cols:
-                logging.warning(f"Missing optional column '{col}' in table '{table}'")
+                logging.warning(f"Missing optional column '{col}' in table '{schema}.{table}'")
 
 class CohortBuilder:
     """
@@ -95,12 +96,14 @@ class CohortBuilder:
         self.db = db_connector
         self.tables = db_connector.tables
         self.config = self.load_config(config_path)
+        # Get schema from database config and store as instance variable
+        self.schema = self.db.config.get('postgres', {}).get('schema', 'public')
         # YAML schema validation
         for cohort, cfg in self.config.get('cohorts', {}).items():
             if 'inclusion' not in cfg:
                 logging.error(f"Cohort '{cohort}' is missing required 'inclusion' section in YAML config.")
                 raise ValueError(f"Cohort '{cohort}' is missing required 'inclusion' section in YAML config.")
-        check_db_schema(self.db.engine)
+        check_db_schema(self.db.engine, schema=self.schema)
 
     def load_config(self, path):
         """
@@ -112,6 +115,16 @@ class CohortBuilder:
         """
         with open(path, 'r') as f:
             return yaml.safe_load(f)
+    
+    def _table(self, table_name):
+        """
+        Get fully qualified table name with schema prefix.
+        Args:
+            table_name: Name of the table
+        Returns:
+            str: Schema-qualified table name (e.g., 'public.claims_entries')
+        """
+        return f"{self.schema}.{table_name}"
 
     def build_cohort(self, cohort_name):
         logging.info(f"Processing cohort: {cohort_name}")
@@ -146,22 +159,22 @@ class CohortBuilder:
         select_cols = "ce.member_id_hash, ce.date_of_service, cd.icd_code, ce.claim_type"
         query = f'''
         SELECT {select_cols}
-        FROM claims_entries ce
-        INNER JOIN claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
+        FROM {self.schema}.claims_entries ce
+        INNER JOIN {self.schema}.claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
         {where_clause}
         ORDER BY ce.member_id_hash, ce.date_of_service
         '''
-        claims = pd.read_sql(query, self.db.engine)
+        claims = pd.read_sql(text(query), self.db.engine)
         if 'symptom_codes' in inclusion_cfg and 'symptom_window_days' in inclusion_cfg:
             symptom_cond = self._icd_code_sql_filter(inclusion_cfg['symptom_codes'])
             window = inclusion_cfg['symptom_window_days']
             symptom_query = f'''
             SELECT ce.member_id_hash, ce.date_of_service, cd.icd_code
-            FROM claims_entries ce
-            INNER JOIN claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
+            FROM {self.schema}.claims_entries ce
+            INNER JOIN {self.schema}.claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
             WHERE {symptom_cond}
             '''
-            symptom_claims = pd.read_sql(symptom_query, self.db.engine)
+            symptom_claims = pd.read_sql(text(symptom_query), self.db.engine)
             claims['has_symptom_code'] = claims.apply(
                 lambda row: (
                     symptom_claims[(symptom_claims['member_id_hash'] == row['member_id_hash']) &
@@ -292,11 +305,11 @@ class CohortBuilder:
             subtype_cond = self._icd_code_sql_filter(subtypes)
             subtype_query = f'''
             SELECT ce.member_id_hash, ce.date_of_service, cd.icd_code
-            FROM claims_entries ce
-            INNER JOIN claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
+            FROM {self.schema}.claims_entries ce
+            INNER JOIN {self.schema}.claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
             WHERE {subtype_cond}
             '''
-            subtype_claims = pd.read_sql(subtype_query, self.db.engine)
+            subtype_claims = pd.read_sql(text(subtype_query), self.db.engine)
             # Exclude if any subtype claim within window
             def has_subtype(row):
                 sub = subtype_claims[(subtype_claims['member_id_hash'] == row[member_col]) &
@@ -310,11 +323,11 @@ class CohortBuilder:
             organic_cond = self._icd_code_sql_filter(organic_gi)
             organic_query = f'''
             SELECT ce.member_id_hash, ce.date_of_service, cd.icd_code
-            FROM claims_entries ce
-            INNER JOIN claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
+            FROM {self.schema}.claims_entries ce
+            INNER JOIN {self.schema}.claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
             WHERE {organic_cond}
             '''
-            organic_claims = pd.read_sql(organic_query, self.db.engine)
+            organic_claims = pd.read_sql(text(organic_query), self.db.engine)
             def has_organic(row):
                 org = organic_claims[(organic_claims['member_id_hash'] == row[member_col]) &
                                      (abs((pd.to_datetime(organic_claims['date_of_service']) - pd.to_datetime(row[date_col])).dt.days) <= window)]
@@ -332,24 +345,24 @@ class CohortBuilder:
         select_cols = "ce.member_id_hash, ce.date_of_service, cd.icd_code, ce.claim_type"
         query = f'''
         SELECT {select_cols}
-        FROM claims_entries ce
-        INNER JOIN claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
+        FROM {self.schema}.claims_entries ce
+        INNER JOIN {self.schema}.claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
         {where_clause}
         ORDER BY ce.member_id_hash, ce.date_of_service
         '''
-        claims = pd.read_sql(query, self.db.engine)
+        claims = pd.read_sql(text(query), self.db.engine)
         # Lookback for no prior diabetes (PreDiabetes, GDM)
         if cohort_name in ["PreDiabetes", "GDM"] and 'lookback_no_diabetes' in inclusion_cfg:
             lookback_months = inclusion_cfg['lookback_no_diabetes']
-            diabetes_codes = self.config['cohorts']['Diabetes_NoComp']['inclusion']['icd_codes']
+            diabetes_codes = self.config['cohorts']['Diabetes_General']['inclusion']['icd_codes']
             diabetes_cond = self._icd_code_sql_filter(diabetes_codes)
             diabetes_query = f'''
             SELECT ce.member_id_hash, ce.date_of_service, cd.icd_code
-            FROM claims_entries ce
-            INNER JOIN claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
+            FROM {self.schema}.claims_entries ce
+            INNER JOIN {self.schema}.claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
             WHERE {diabetes_cond}
             '''
-            diabetes_claims = pd.read_sql(diabetes_query, self.db.engine)
+            diabetes_claims = pd.read_sql(text(diabetes_query), self.db.engine)
             # Remove members with diabetes code in lookback window
             def has_prior_diabetes(row):
                 prior = diabetes_claims[(diabetes_claims['member_id_hash'] == row['member_id_hash']) &
@@ -396,74 +409,74 @@ class CohortBuilder:
             diabetes_cond = self._icd_code_sql_filter(diabetes_codes)
             diabetes_query = f'''
             SELECT ce.member_id_hash, ce.date_of_service, cd.icd_code
-            FROM claims_entries ce
-            INNER JOIN claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
+            FROM {self.schema}.claims_entries ce
+            INNER JOIN {self.schema}.claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
             WHERE {diabetes_cond}
             '''
-            diabetes_claims = pd.read_sql(diabetes_query, self.db.engine)
+            diabetes_claims = pd.read_sql(text(diabetes_query), self.db.engine)
             def has_diabetes(row):
                 diag = diabetes_claims[(diabetes_claims['member_id_hash'] == row[member_col]) &
                                         (pd.to_datetime(diabetes_claims['date_of_service']) <= pd.to_datetime(row[date_col]))]
                 return diag.shape[0] > 0
             index_dates = index_dates[~index_dates.apply(has_diabetes, axis=1)]
-        # Exclude GDM codes (PreDiabetes, Diabetes_NoComp, Diabetes_HTN, Diabetes_Kidney)
+        # Exclude GDM codes (PreDiabetes, Diabetes_General)
         if 'gdm_codes' in exclusion_cfg:
             gdm_codes = exclusion_cfg['gdm_codes']
             gdm_cond = self._icd_code_sql_filter(gdm_codes)
             gdm_query = f'''
             SELECT ce.member_id_hash, ce.date_of_service, cd.icd_code
-            FROM claims_entries ce
-            INNER JOIN claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
+            FROM {self.schema}.claims_entries ce
+            INNER JOIN {self.schema}.claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
             WHERE {gdm_cond}
             '''
-            gdm_claims = pd.read_sql(gdm_query, self.db.engine)
+            gdm_claims = pd.read_sql(text(gdm_query), self.db.engine)
             def has_gdm(row):
                 diag = gdm_claims[gdm_claims['member_id_hash'] == row[member_col]]
                 return diag.shape[0] > 0
             index_dates = index_dates[~index_dates.apply(has_gdm, axis=1)]
-        # Exclude ESRD/CKD5 for NoComp/HTN
-        if cohort_name in ["Diabetes_NoComp", "Diabetes_HTN"]:
+        # Exclude ESRD/CKD5 for Diabetes_General (if needed)
+        if cohort_name == "Diabetes_General":
             for code_key in ['esrd_codes', 'ckd5_codes']:
                 if code_key in exclusion_cfg:
                     codes = exclusion_cfg[code_key]
                     cond = self._icd_code_sql_filter(codes)
                     query = f'''
                     SELECT ce.member_id_hash, ce.date_of_service, cd.icd_code
-                    FROM claims_entries ce
-                    INNER JOIN claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
+                    FROM {self.schema}.claims_entries ce
+                    INNER JOIN {self.schema}.claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
                     WHERE {cond}
                     '''
-                    claims = pd.read_sql(query, self.db.engine)
+                    claims = pd.read_sql(text(query), self.db.engine)
                     def has_code(row):
                         diag = claims[claims['member_id_hash'] == row[member_col]]
                         return diag.shape[0] > 0
                     index_dates = index_dates[~index_dates.apply(has_code, axis=1)]
-        # Exclude HTN for NoComp
-        if cohort_name == "Diabetes_NoComp" and 'htn_codes' in exclusion_cfg:
+        # Exclude HTN for Diabetes_General (if needed)
+        if cohort_name == "Diabetes_General" and 'htn_codes' in exclusion_cfg:
             htn_codes = exclusion_cfg['htn_codes']
             htn_cond = self._icd_code_sql_filter(htn_codes)
             htn_query = f'''
             SELECT ce.member_id_hash, ce.date_of_service, cd.icd_code
-            FROM claims_entries ce
-            INNER JOIN claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
+            FROM {self.schema}.claims_entries ce
+            INNER JOIN {self.schema}.claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
             WHERE {htn_cond}
             '''
-            htn_claims = pd.read_sql(htn_query, self.db.engine)
+            htn_claims = pd.read_sql(text(htn_query), self.db.engine)
             def has_htn(row):
                 diag = htn_claims[htn_claims['member_id_hash'] == row[member_col]]
                 return diag.shape[0] > 0
             index_dates = index_dates[~index_dates.apply(has_htn, axis=1)]
-        # Exclude CKD stages 1-4 for Diabetes_Kidney
-        if cohort_name == "Diabetes_Kidney" and 'ckd_stages_1_4' in exclusion_cfg:
+        # Exclude CKD stages 1-4 for Diabetes_General (if needed)
+        if cohort_name == "Diabetes_General" and 'ckd_stages_1_4' in exclusion_cfg:
             ckd_codes = exclusion_cfg['ckd_stages_1_4']
             ckd_cond = self._icd_code_sql_filter(ckd_codes)
             ckd_query = f'''
             SELECT ce.member_id_hash, ce.date_of_service, cd.icd_code
-            FROM claims_entries ce
-            INNER JOIN claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
+            FROM {self.schema}.claims_entries ce
+            INNER JOIN {self.schema}.claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
             WHERE {ckd_cond}
             '''
-            ckd_claims = pd.read_sql(ckd_query, self.db.engine)
+            ckd_claims = pd.read_sql(text(ckd_query), self.db.engine)
             def has_ckd(row):
                 diag = ckd_claims[ckd_claims['member_id_hash'] == row[member_col]]
                 return diag.shape[0] > 0
@@ -474,11 +487,11 @@ class CohortBuilder:
             pre_dm_cond = self._icd_code_sql_filter(pre_dm_codes)
             pre_dm_query = f'''
             SELECT ce.member_id_hash, ce.date_of_service, cd.icd_code
-            FROM claims_entries ce
-            INNER JOIN claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
+            FROM {self.schema}.claims_entries ce
+            INNER JOIN {self.schema}.claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
             WHERE {pre_dm_cond}
             '''
-            pre_dm_claims = pd.read_sql(pre_dm_query, self.db.engine)
+            pre_dm_claims = pd.read_sql(text(pre_dm_query), self.db.engine)
             def has_pre_dm(row):
                 diag = pre_dm_claims[pre_dm_claims['member_id_hash'] == row[member_col]]
                 return diag.shape[0] > 0
@@ -489,11 +502,11 @@ class CohortBuilder:
             o9981_cond = self._icd_code_sql_filter(o9981_codes)
             o9981_query = f'''
             SELECT ce.member_id_hash, ce.date_of_service, cd.icd_code
-            FROM claims_entries ce
-            INNER JOIN claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
+            FROM {self.schema}.claims_entries ce
+            INNER JOIN {self.schema}.claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
             WHERE {o9981_cond}
             '''
-            o9981_claims = pd.read_sql(o9981_query, self.db.engine)
+            o9981_claims = pd.read_sql(text(o9981_query), self.db.engine)
             def has_o9981(row):
                 diag = o9981_claims[o9981_claims['member_id_hash'] == row[member_col]]
                 return diag.shape[0] > 0
@@ -507,12 +520,12 @@ class CohortBuilder:
         icd_filter = self._icd_code_sql_filter(icd_codes)
         query = f'''
         SELECT ce.member_id_hash, ce.date_of_service
-        FROM claims_entries ce
-        INNER JOIN claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
+        FROM {self.schema}.claims_entries ce
+        INNER JOIN {self.schema}.claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
         WHERE ({icd_filter}) AND ce.claim_type = 'medical'
         ORDER BY ce.member_id_hash, ce.date_of_service
         '''
-        claims = pd.read_sql(query, self.db.engine)
+        claims = pd.read_sql(text(query), self.db.engine)
         # Find members with >=2 claims >=30 days apart
         claims['date_of_service'] = pd.to_datetime(claims['date_of_service'])
         idx_dates = []
@@ -534,11 +547,11 @@ class CohortBuilder:
             code_filter = self._icd_code_sql_filter(codes)
             q = f'''
             SELECT ce.member_id_hash, ce.date_of_service, '{label}' as component
-            FROM claims_entries ce
-            INNER JOIN claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
+            FROM {self.schema}.claims_entries ce
+            INNER JOIN {self.schema}.claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
             WHERE {code_filter} AND ce.claim_type = 'medical'
             '''
-            comp_claims.append(pd.read_sql(q, self.db.engine))
+            comp_claims.append(pd.read_sql(text(q), self.db.engine))
         comp_df = pd.concat(comp_claims) if comp_claims else pd.DataFrame()
         comp_df['date_of_service'] = pd.to_datetime(comp_df['date_of_service'])
         # For each member, find a window with >=3 unique components in 365 days
@@ -562,11 +575,11 @@ class CohortBuilder:
                     code_filter = self._icd_code_sql_filter(codes)
                     q = f'''
                     SELECT ce.member_id_hash
-                    FROM claims_entries ce
-                    INNER JOIN claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
+                    FROM {self.schema}.claims_entries ce
+                    INNER JOIN {self.schema}.claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
                     WHERE {code_filter}
                     '''
-                    excl_members = pd.read_sql(q, self.db.engine)['member_id_hash'].unique()
+                    excl_members = pd.read_sql(text(q), self.db.engine)['member_id_hash'].unique()
                     idx_df = idx_df[~idx_df['member_id_hash'].isin(excl_members)]
         return idx_df
 
@@ -577,11 +590,11 @@ class CohortBuilder:
         icd_filter = self._icd_code_sql_filter(icd_codes)
         q = f'''
         SELECT ce.member_id_hash, ce.date_of_service
-        FROM claims_entries ce
-        INNER JOIN claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
+        FROM {self.schema}.claims_entries ce
+        INNER JOIN {self.schema}.claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
         WHERE ({icd_filter}) AND ce.claim_type = 'medical'
         '''
-        claims = pd.read_sql(q, self.db.engine)
+        claims = pd.read_sql(text(q), self.db.engine)
         claims['date_of_service'] = pd.to_datetime(claims['date_of_service'])
         # 2 claims >= min_days_between_claims apart
         min_claims = inclusion_cfg.get('min_claims', 2)
@@ -602,11 +615,11 @@ class CohortBuilder:
                 code_filter = self._icd_code_sql_filter(codes)
                 q = f'''
                 SELECT ce.member_id_hash
-                FROM claims_entries ce
-                INNER JOIN claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
+                FROM {self.schema}.claims_entries ce
+                INNER JOIN {self.schema}.claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
                 WHERE {code_filter}
                 '''
-                excl_members = pd.read_sql(q, self.db.engine)['member_id_hash'].unique()
+                excl_members = pd.read_sql(text(q), self.db.engine)['member_id_hash'].unique()
                 idx_df = idx_df[~idx_df['member_id_hash'].isin(excl_members)]
         return idx_df
 
@@ -620,12 +633,12 @@ class CohortBuilder:
         select_cols = "ce.member_id_hash, ce.date_of_service, cd.icd_code, ce.claim_type"
         query = f'''
         SELECT {select_cols}
-        FROM claims_entries ce
-        INNER JOIN claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
+        FROM {self.schema}.claims_entries ce
+        INNER JOIN {self.schema}.claims_diagnoses cd ON ce.claim_entry_id = cd.claim_entry_id
         {where_clause}
         ORDER BY ce.member_id_hash, ce.date_of_service
         '''
-        claims = pd.read_sql(query, self.db.engine)
+        claims = pd.read_sql(text(query), self.db.engine)
         # Rx support
         if inclusion_cfg.get('allow_rx_support') and 'rx_codes' in inclusion_cfg:
             # This is a stub: you would need to join to Rx table or filter claims with Rx codes
@@ -635,15 +648,19 @@ class CohortBuilder:
             procedure_codes = inclusion_cfg['procedure_codes']
             # Get procedure support for all members in the claims
             member_ids = claims['member_id_hash'].unique().tolist()
+            logging.info(f"  Checking procedure support for {len(member_ids):,} members...")
             procedure_support = self.batch_get_procedure_support(member_ids, procedure_codes)
             claims['has_procedure_support'] = claims['member_id_hash'].map(procedure_support)
+            logging.info(f"  Found procedure support for {sum(procedure_support.values()):,} members")
         # Drug support
         if inclusion_cfg.get('allow_medication') and 'medication_codes' in inclusion_cfg:
             medication_codes = inclusion_cfg['medication_codes']
             # Get drug support for all members in the claims
             member_ids = claims['member_id_hash'].unique().tolist()
+            logging.info(f"  Checking medication support for {len(member_ids):,} members...")
             drug_support = self.batch_get_drug_support(member_ids, medication_codes)
             claims['has_drug_support'] = claims['member_id_hash'].map(drug_support)
+            logging.info(f"  Found medication support for {sum(drug_support.values()):,} members")
         return claims
 
     def get_cardiometabolic_index_dates(self, cohort_name, inc_claims, inclusion_cfg):
@@ -736,12 +753,12 @@ class CohortBuilder:
         # Use SQLAlchemy engine for all queries
         code_filter = self._icd_code_sql_filter(codes, table_alias='cd')
         query = f"""
-        SELECT 1 FROM claims_diagnoses cd
-        INNER JOIN claims_entries ce ON cd.claim_entry_id = ce.claim_entry_id
+        SELECT 1 FROM {self.schema}.claims_diagnoses cd
+        INNER JOIN {self.schema}.claims_entries ce ON cd.claim_entry_id = ce.claim_entry_id
         WHERE ce.member_id_hash = '{member_id_hash}' AND ({code_filter})
         LIMIT 1
         """
-        result = pd.read_sql(query, self.db.engine)
+        result = pd.read_sql(text(query), self.db.engine)
         return not result.empty
 
     def batch_tag_members(self, member_ids, codes, tag_name):
@@ -750,12 +767,12 @@ class CohortBuilder:
         member_list = ",".join([f"'{mid}'" for mid in member_ids])
         query = f"""
         SELECT ce.member_id_hash
-        FROM claims_diagnoses cd
-        INNER JOIN claims_entries ce ON cd.claim_entry_id = ce.claim_entry_id
+        FROM {self.schema}.claims_diagnoses cd
+        INNER JOIN {self.schema}.claims_entries ce ON cd.claim_entry_id = ce.claim_entry_id
         WHERE ce.member_id_hash IN ({member_list}) AND ({code_filter})
         GROUP BY ce.member_id_hash
         """
-        result = pd.read_sql(query, self.db.engine)
+        result = pd.read_sql(text(query), self.db.engine)
         tagged = set(result['member_id_hash'])
         return {mid: (mid in tagged) for mid in member_ids}
 
@@ -837,14 +854,14 @@ class CohortBuilder:
             
         proc_filter = self._procedure_code_sql_filter(procedure_codes, table_alias='cp')
         query = f"""
-        SELECT 1 FROM claims_procedures cp
-        INNER JOIN claims_entries ce ON cp.claim_entry_id = ce.claim_entry_id
+        SELECT 1 FROM {self.schema}.claims_procedures cp
+        INNER JOIN {self.schema}.claims_entries ce ON cp.claim_entry_id = ce.claim_entry_id
         WHERE ce.member_id_hash = '{member_id_hash}' 
           AND ({proc_filter})
           AND cp.proc_code != '0000000'
         LIMIT 1
         """
-        result = pd.read_sql(query, self.db.engine)
+        result = pd.read_sql(text(query), self.db.engine)
         return not result.empty
 
     def get_procedure_support_with_window(self, member_id_hash, procedure_codes, index_date, window_days=180):
@@ -863,8 +880,8 @@ class CohortBuilder:
             
         proc_filter = self._procedure_code_sql_filter(procedure_codes, table_alias='cp')
         query = f"""
-        SELECT 1 FROM claims_procedures cp
-        INNER JOIN claims_entries ce ON cp.claim_entry_id = ce.claim_entry_id
+        SELECT 1 FROM {self.schema}.claims_procedures cp
+        INNER JOIN {self.schema}.claims_entries ce ON cp.claim_entry_id = ce.claim_entry_id
         WHERE ce.member_id_hash = '{member_id_hash}' 
           AND ({proc_filter})
           AND cp.proc_code != '0000000'
@@ -872,7 +889,7 @@ class CohortBuilder:
           AND ce.date_of_service <= CAST('{index_date}' AS DATE)
         LIMIT 1
         """
-        result = pd.read_sql(query, self.db.engine)
+        result = pd.read_sql(text(query), self.db.engine)
         return not result.empty
 
     def batch_get_procedure_support(self, member_ids, procedure_codes, window_days=180):
@@ -887,21 +904,31 @@ class CohortBuilder:
         """
         if not procedure_codes or not member_ids:
             return {mid: False for mid in member_ids}
+        
+        # Process in batches to avoid SQL IN clause limits and improve performance
+        batch_size = 1000
+        all_results = {}
+        
+        for i in range(0, len(member_ids), batch_size):
+            batch = member_ids[i:i+batch_size]
+            logging.debug(f"    Processing procedure batch {i//batch_size + 1}/{(len(member_ids)-1)//batch_size + 1} ({len(batch)} members)")
             
-        proc_filter = self._procedure_code_sql_filter(procedure_codes, table_alias='cp')
-        member_list = ",".join([f"'{mid}'" for mid in member_ids])
-        query = f"""
-        SELECT ce.member_id_hash
-        FROM claims_procedures cp
-        INNER JOIN claims_entries ce ON cp.claim_entry_id = ce.claim_entry_id
-        WHERE ce.member_id_hash IN ({member_list}) 
-          AND ({proc_filter})
-          AND cp.proc_code != '0000000'
-        GROUP BY ce.member_id_hash
-        """
-        result = pd.read_sql(query, self.db.engine)
-        members_with_procedures = set(result['member_id_hash'].tolist())
-        return {mid: mid in members_with_procedures for mid in member_ids}
+            proc_filter = self._procedure_code_sql_filter(procedure_codes, table_alias='cp')
+            member_list = ",".join([f"'{mid}'" for mid in batch])
+            query = f"""
+            SELECT ce.member_id_hash
+            FROM {self.schema}.claims_procedures cp
+            INNER JOIN {self.schema}.claims_entries ce ON cp.claim_entry_id = ce.claim_entry_id
+            WHERE ce.member_id_hash IN ({member_list}) 
+              AND ({proc_filter})
+              AND cp.proc_code != '0000000'
+            GROUP BY ce.member_id_hash
+            """
+            result = pd.read_sql(text(query), self.db.engine)
+            batch_results = set(result['member_id_hash'].tolist())
+            all_results.update({mid: mid in batch_results for mid in batch})
+        
+        return all_results
 
     def _drug_name_sql_filter(self, drug_names, table_alias='cd'):
         """
@@ -936,8 +963,8 @@ class CohortBuilder:
             
         drug_filter = self._drug_name_sql_filter(drug_names, table_alias='cd')
         query = f"""
-        SELECT 1 FROM claims_drugs cd
-        INNER JOIN claims_entries ce ON cd.claim_entry_id = ce.claim_entry_id
+        SELECT 1 FROM {self.schema}.claims_drugs cd
+        INNER JOIN {self.schema}.claims_entries ce ON cd.claim_entry_id = ce.claim_entry_id
         WHERE ce.member_id_hash = '{member_id_hash}' 
           AND ce.claim_type = 'pharma'
           AND ({drug_filter})
@@ -945,7 +972,7 @@ class CohortBuilder:
           AND cd.product_service_name != ''
         LIMIT 1
         """
-        result = pd.read_sql(query, self.db.engine)
+        result = pd.read_sql(text(query), self.db.engine)
         return not result.empty
 
     def get_drug_support_with_window(self, member_id_hash, drug_names, index_date, window_days=180):
@@ -964,8 +991,8 @@ class CohortBuilder:
             
         drug_filter = self._drug_name_sql_filter(drug_names, table_alias='cd')
         query = f"""
-        SELECT 1 FROM claims_drugs cd
-        INNER JOIN claims_entries ce ON cd.claim_entry_id = ce.claim_entry_id
+        SELECT 1 FROM {self.schema}.claims_drugs cd
+        INNER JOIN {self.schema}.claims_entries ce ON cd.claim_entry_id = ce.claim_entry_id
         WHERE ce.member_id_hash = '{member_id_hash}' 
           AND ce.claim_type = 'pharma'
           AND ({drug_filter})
@@ -975,7 +1002,7 @@ class CohortBuilder:
           AND ce.date_of_service <= CAST('{index_date}' AS DATE)
         LIMIT 1
         """
-        result = pd.read_sql(query, self.db.engine)
+        result = pd.read_sql(text(query), self.db.engine)
         return not result.empty
 
     def batch_get_drug_support(self, member_ids, drug_names, window_days=180):
@@ -990,20 +1017,30 @@ class CohortBuilder:
         """
         if not drug_names or not member_ids:
             return {mid: False for mid in member_ids}
+        
+        # Process in batches to avoid SQL IN clause limits and improve performance
+        batch_size = 1000
+        all_results = {}
+        
+        for i in range(0, len(member_ids), batch_size):
+            batch = member_ids[i:i+batch_size]
+            logging.debug(f"    Processing drug batch {i//batch_size + 1}/{(len(member_ids)-1)//batch_size + 1} ({len(batch)} members)")
             
-        drug_filter = self._drug_name_sql_filter(drug_names, table_alias='cd')
-        member_list = ",".join([f"'{mid}'" for mid in member_ids])
-        query = f"""
-        SELECT ce.member_id_hash
-        FROM claims_drugs cd
-        INNER JOIN claims_entries ce ON cd.claim_entry_id = ce.claim_entry_id
-        WHERE ce.member_id_hash IN ({member_list}) 
-          AND ce.claim_type = 'pharma'
-          AND ({drug_filter})
-          AND cd.product_service_name IS NOT NULL
-          AND cd.product_service_name != ''
-        GROUP BY ce.member_id_hash
-        """
-        result = pd.read_sql(query, self.db.engine)
-        members_with_drugs = set(result['member_id_hash'].tolist())
-        return {mid: mid in members_with_drugs for mid in member_ids}
+            drug_filter = self._drug_name_sql_filter(drug_names, table_alias='cd')
+            member_list = ",".join([f"'{mid}'" for mid in batch])
+            query = f"""
+            SELECT ce.member_id_hash
+            FROM {self.schema}.claims_drugs cd
+            INNER JOIN {self.schema}.claims_entries ce ON cd.claim_entry_id = ce.claim_entry_id
+            WHERE ce.member_id_hash IN ({member_list}) 
+              AND ce.claim_type = 'pharma'
+              AND ({drug_filter})
+              AND cd.product_service_name IS NOT NULL
+              AND cd.product_service_name != ''
+            GROUP BY ce.member_id_hash
+            """
+            result = pd.read_sql(text(query), self.db.engine)
+            batch_results = set(result['member_id_hash'].tolist())
+            all_results.update({mid: mid in batch_results for mid in batch})
+        
+        return all_results

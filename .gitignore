@@ -77,7 +77,8 @@ diabetes_analysis_v3.py
 *.sqlite
 *.sqlite3
 
-# Configuration overrides
+# Configuration overrides (contains sensitive database credentials)
+configs/db_connection.yaml
 configs/*_prod.yaml
 configs/*_local.yaml
 .env

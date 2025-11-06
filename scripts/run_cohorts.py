@@ -26,9 +26,8 @@ def main():
     db_config_path = os.path.join(base_dir, 'configs', 'db_connection.yaml')
     cohort_config_path = os.path.join(base_dir, 'configs', 'cohorts.yaml')
 
-    # Initialize database connection
+    # Initialize database connection (load_tables() is called automatically in __init__)
     db_connector = DBConnector(db_config_path)
-    db_connector.load_tables()
 
     # Initialize cohort builder
     cohort_builder = CohortBuilder(db_connector, cohort_config_path)
